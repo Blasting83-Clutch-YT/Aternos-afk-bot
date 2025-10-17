@@ -1,3 +1,4 @@
+// index.js - reconnection-based username rotator (use on offline/cracked servers)
 const fs = require('fs');
 const path = require('path');
 const mineflayer = require('mineflayer');
@@ -5,24 +6,20 @@ const Movements = require('mineflayer-pathfinder').Movements;
 const pathfinder = require('mineflayer-pathfinder').pathfinder;
 const { GoalBlock } = require('mineflayer-pathfinder').goals;
 
-const config = require('./settings.json');
+const SETTINGS_PATH = path.resolve(__dirname, 'settings.json');
+if (!fs.existsSync(SETTINGS_PATH)) {
+  console.error('Missing settings.json. Copy settings.example.json to settings.json and edit it (do NOT commit real credentials).');
+  process.exit(1);
+}
+const config = require(SETTINGS_PATH);
 const express = require('express');
 
 const app = express();
+app.get('/', (req, res) => res.send('Bot has arrived'));
+app.listen(8000, () => console.log('Server started'));
 
-app.get('/', (req, res) => {
-  res.send('Bot has arrived');
-});
-
-app.listen(8000, () => {
-  console.log('Server started');
-});
-
-// Persisted state file for nickname rotation (ignored by .gitignore)
+// Persisted rotation state (ignored by .gitignore)
 const STATE_PATH = path.resolve(__dirname, '.nick_state.json');
-// Nick rotator config must be added to settings.json (see README below). Example path: config['nick-rotator']
-const NICK_CFG = config['nick-rotator'] || { enabled: false, names: [], intervalMs: 4 * 60 * 60 * 1000 };
-
 let nickState = { lastIndex: -1 };
 try {
   if (fs.existsSync(STATE_PATH)) {
@@ -34,207 +31,155 @@ try {
   console.warn('Could not read .nick_state.json, starting fresh.');
 }
 function saveNickState() {
-  try {
-    fs.writeFileSync(STATE_PATH, JSON.stringify(nickState, null, 2), 'utf8');
-  } catch (err) {
-    console.warn('Failed to write .nick_state.json:', err);
-  }
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify(nickState, null, 2), 'utf8'); } 
+  catch (err) { console.warn('Failed to write .nick_state.json:', err); }
 }
+
+// Nick rotator configuration - defaults to 3 hours
+const NICK_CFG = config['nick-rotator'] || { enabled: false, names: [], intervalMs: 3 * 60 * 60 * 1000 };
 
 let currentBot = null;
 let nickIntervalId = null;
+let rotationScheduled = false;
 
-function rotateNick() {
-  if (!NICK_CFG.enabled) return;
-  if (!Array.isArray(NICK_CFG.names) || NICK_CFG.names.length === 0) return;
-  if (!currentBot || !currentBot.chat) {
-    console.log('[NickRotator] No connected bot to send nick command to.');
-    return;
+function getNextNick() {
+  if (!Array.isArray(NICK_CFG.names) || NICK_CFG.names.length === 0) return null;
+  nickState.lastIndex = (nickState.lastIndex + 1) % NICK_CFG.names.length;
+  saveNickState();
+  return NICK_CFG.names[nickState.lastIndex];
+}
+
+function createBotWithUsername(username) {
+  const account = Object.assign({}, config['bot-account'] || {});
+  if (username) account.username = username;
+
+  const bot = mineflayer.createBot({
+    username: account.username,
+    password: account.password,
+    auth: account.type,
+    host: config.server.ip,
+    port: config.server.port,
+    version: config.server.version,
+  });
+
+  currentBot = bot;
+
+  bot.loadPlugin(pathfinder);
+  const mcData = require('minecraft-data')(bot.version);
+  const defaultMove = new Movements(bot, mcData);
+  bot.settings.colorsEnabled = false;
+
+  let pendingPromise = Promise.resolve();
+
+  function sendRegister(password) {
+    return new Promise((resolve, reject) => {
+      bot.chat(`/register ${password} ${password}`);
+      bot.once('chat', (username, message) => {
+        if (message.includes('successfully registered') || message.includes('already registered')) resolve();
+        else reject(`Registration failed: "${message}"`);
+      });
+    });
+  }
+  function sendLogin(password) {
+    return new Promise((resolve, reject) => {
+      bot.chat(`/login ${password}`);
+      bot.once('chat', (username, message) => {
+        if (message.includes('successfully logged in')) resolve();
+        else reject(`Login failed: "${message}"`);
+      });
+    });
   }
 
-  nickState.lastIndex = (nickState.lastIndex + 1) % NICK_CFG.names.length;
-  const newNick = NICK_CFG.names[nickState.lastIndex];
+  bot.once('spawn', () => {
+    console.log('[AfkBot] Bot joined the server as', bot.username);
 
-  // Try common /nick variants. Adjust order if your server uses specific command.
-  const commands = [
-    `/nick ${newNick}`,
-    `/nick ${currentBot.username} ${newNick}`,
-    `/nick set ${newNick}`
-  ];
+    // Auto-auth if configured
+    if (config.utils && config.utils['auto-auth'] && config.utils['auto-auth'].enabled) {
+      const password = config.utils['auto-auth'].password;
+      pendingPromise = pendingPromise
+        .then(() => sendRegister(password))
+        .then(() => sendLogin(password))
+        .catch(error => console.error('[ERROR]', error));
+    }
 
-  // Send the first guess. To be more robust, extend to parse chat replies and only advance on success.
-  currentBot.chat(commands[0]);
-  console.log(`[${new Date().toISOString()}] [NickRotator] Sent: ${commands[0]} -> ${newNick}`);
+    // Chat messages
+    if (config.utils && config.utils['chat-messages'] && config.utils['chat-messages'].enabled) {
+      const messages = config.utils['chat-messages']['messages'] || [];
+      if (config.utils['chat-messages'].repeat) {
+        const delay = config.utils['chat-messages']['repeat-delay'] || 60;
+        let i = 0;
+        setInterval(() => {
+          bot.chat(messages[i] || '');
+          i = (i + 1) % messages.length;
+        }, delay * 1000);
+      } else messages.forEach(m => bot.chat(m));
+    }
 
-  saveNickState();
+    // Movement/anti-afk as before
+    const pos = config.position || {};
+    if (pos.enabled) {
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalBlock(pos.x, pos.y, pos.z));
+    }
+    if (config.utils && config.utils['anti-afk'] && config.utils['anti-afk'].enabled) {
+      bot.setControlState('jump', true);
+      if (config.utils['anti-afk'].sneak) bot.setControlState('sneak', true);
+    }
+
+    // Schedule rotation if needed (only schedule once per process)
+    scheduleRotationIfNeeded();
+  });
+
+  // On disconnect -> immediately reconnect using next username (if rotator enabled)
+  bot.on('end', () => {
+    console.log('[AfkBot] Connection ended.');
+    currentBot = null;
+    if (NICK_CFG.enabled) {
+      const next = getNextNick();
+      if (next) {
+        console.log(`[NickRotator] Reconnecting after disconnect with username: ${next}`);
+        setTimeout(() => createBotWithUsername(next), 2000);
+        return;
+      }
+    }
+    // fallback reconnect with same account if configured
+    if (config.utils && config.utils['auto-reconnect']) {
+      setTimeout(() => createBotWithUsername(account.username), config.utils['auto-recconect-delay'] || 5000);
+    }
+  });
+
+  bot.on('kicked', (reason) => console.log('[AfkBot] Kicked:', reason));
+  bot.on('error', (err) => console.log('[AfkBot] Error:', err && err.message));
+  return bot;
 }
 
-function createBot() {
-   const bot = mineflayer.createBot({
-      username: config['bot-account']['username'],
-      password: config['bot-account']['password'],
-      auth: config['bot-account']['type'],
-      host: config.server.ip,
-      port: config.server.port,
-      version: config.server.version,
-   });
+function scheduleRotationIfNeeded() {
+  if (!NICK_CFG.enabled) return;
+  if (!Array.isArray(NICK_CFG.names) || NICK_CFG.names.length === 0) return;
+  if (rotationScheduled) return;
+  rotationScheduled = true;
 
-   currentBot = bot; // keep global reference
+  const intervalMs = typeof NICK_CFG.intervalMs === 'number' ? NICK_CFG.intervalMs : 3 * 60 * 60 * 1000;
+  nickIntervalId = setInterval(() => {
+    if (!currentBot) { console.log('[NickRotator] No connected bot when interval fired; waiting for reconnect.'); return; }
+    const next = getNextNick();
+    if (!next) { console.warn('[NickRotator] No names configured.'); return; }
+    console.log(`[NickRotator] Interval triggered. Reconnecting with username: ${next}`);
+    try {
+      if (nickIntervalId) { clearInterval(nickIntervalId); nickIntervalId = null; rotationScheduled = false; }
+      if (currentBot && currentBot.quit) { try { currentBot.quit(); } catch (e) {} }
+      setTimeout(() => createBotWithUsername(next), 2000);
+    } catch (e) { console.warn('Nick rotation reconnection error:', e); }
+  }, intervalMs);
 
-   bot.loadPlugin(pathfinder);
-   const mcData = require('minecraft-data')(bot.version);
-   const defaultMove = new Movements(bot, mcData);
-   bot.settings.colorsEnabled = false;
-
-   let pendingPromise = Promise.resolve();
-
-   function sendRegister(password) {
-      return new Promise((resolve, reject) => {
-         bot.chat(`/register ${password} ${password}`);
-         console.log(`[Auth] Sent /register command.`);
-
-         bot.once('chat', (username, message) => {
-            console.log(`[ChatLog] <${username}> ${message}`);
-
-            if (message.includes('successfully registered')) {
-               console.log('[INFO] Registration confirmed.');
-               resolve();
-            } else if (message.includes('already registered')) {
-               console.log('[INFO] Bot was already registered.');
-               resolve();
-            } else if (message.includes('Invalid command')) {
-               reject(`Registration failed: Invalid command. Message: "${message}"`);
-            } else {
-               reject(`Registration failed: unexpected message "${message}".`);
-            }
-         });
-      });
-   }
-
-   function sendLogin(password) {
-      return new Promise((resolve, reject) => {
-         bot.chat(`/login ${password}`);
-         console.log(`[Auth] Sent /login command.`);
-
-         bot.once('chat', (username, message) => {
-            console.log(`[ChatLog] <${username}> ${message}`);
-
-            if (message.includes('successfully logged in')) {
-               console.log('[INFO] Login successful.');
-               resolve();
-            } else if (message.includes('Invalid password')) {
-               reject(`Login failed: Invalid password. Message: "${message}"`);
-            } else if (message.includes('not registered')) {
-               reject(`Login failed: Not registered. Message: "${message}"`);
-            } else {
-               reject(`Login failed: unexpected message "${message}".`);
-            }
-         });
-      });
-   }
-
-   bot.once('spawn', () => {
-      console.log('\x1b[33m[AfkBot] Bot joined the server', '\x1b[0m');
-
-      if (config.utils['auto-auth'].enabled) {
-         console.log('[INFO] Started auto-auth module');
-
-         const password = config.utils['auto-auth'].password;
-
-         pendingPromise = pendingPromise
-            .then(() => sendRegister(password))
-            .then(() => sendLogin(password))
-            .catch(error => console.error('[ERROR]', error));
-      }
-
-      if (config.utils['chat-messages'].enabled) {
-         console.log('[INFO] Started chat-messages module');
-         const messages = config.utils['chat-messages']['messages'];
-
-         if (config.utils['chat-messages'].repeat) {
-            const delay = config.utils['chat-messages']['repeat-delay'];
-            let i = 0;
-
-            let msg_timer = setInterval(() => {
-               bot.chat(`${messages[i]}`);
-
-               if (i + 1 === messages.length) {
-                  i = 0;
-               } else {
-                  i++;
-               }
-            }, delay * 1000);
-         } else {
-            messages.forEach((msg) => {
-               bot.chat(msg);
-            });
-         }
-      }
-
-      const pos = config.position;
-
-      if (config.position.enabled) {
-         console.log(
-            `\x1b[32m[Afk Bot] Starting to move to target location (${pos.x}, ${pos.y}, ${pos.z})\x1b[0m`
-         );
-         bot.pathfinder.setMovements(defaultMove);
-         bot.pathfinder.setGoal(new GoalBlock(pos.x, pos.y, pos.z));
-      }
-
-      if (config.utils['anti-afk'].enabled) {
-         bot.setControlState('jump', true);
-         if (config.utils['anti-afk'].sneak) {
-            bot.setControlState('sneak', true);
-         }
-      }
-
-      // Start nickname rotation once (do not start multiple intervals on reconnects)
-      if (NICK_CFG.enabled && Array.isArray(NICK_CFG.names) && NICK_CFG.names.length > 0) {
-         if (!nickIntervalId) {
-            // run immediately and then every interval
-            rotateNick();
-            nickIntervalId = setInterval(() => {
-              rotateNick();
-            }, typeof NICK_CFG.intervalMs === 'number' ? NICK_CFG.intervalMs : 4 * 60 * 60 * 1000);
-            console.log('[NickRotator] Rotation scheduled. Interval ms:', NICK_CFG.intervalMs);
-         }
-      }
-   });
-
-   bot.on('goal_reached', () => {
-      console.log(
-         `\x1b[32m[AfkBot] Bot arrived at the target location. ${bot.entity.position}\x1b[0m`
-      );
-   });
-
-   bot.on('death', () => {
-      console.log(
-         `\x1b[33m[AfkBot] Bot has died and was respawned at ${bot.entity.position}`,
-         '\x1b[0m'
-      );
-   });
-
-   if (config.utils['auto-reconnect']) {
-      bot.on('end', () => {
-         // clear current bot reference; do not clear the nick interval (it will wait for next createBot to set currentBot)
-         currentBot = null;
-         setTimeout(() => {
-            createBot();
-         }, config.utils['auto-recconect-delay']);
-      });
-   }
-
-   bot.on('kicked', (reason) =>
-      console.log(
-         '\x1b[33m',
-         `[AfkBot] Bot was kicked from the server. Reason: \n${reason}`,
-         '\x1b[0m'
-      )
-   );
-
-   bot.on('error', (err) =>
-      console.log(`\x1b[31m[ERROR] ${err.message}`, '\x1b[0m')
-   );
+  console.log('[NickRotator] Rotation scheduled. Interval ms:', intervalMs);
 }
 
-createBot();
+function startInitialBot() {
+  let initialUsername = null;
+  if (NICK_CFG.enabled) initialUsername = getNextNick();
+  const configuredUsername = (config['bot-account'] && config['bot-account'].username) || 'Bot';
+  createBotWithUsername(initialUsername || configuredUsername);
+}
+
+startInitialBot();
