@@ -1,172 +1,88 @@
+// --- DEPENDANCES ---
 const mineflayer = require('mineflayer');
-const Movements = require('mineflayer-pathfinder').Movements;
-const pathfinder = require('mineflayer-pathfinder').pathfinder;
-const { GoalBlock } = require('mineflayer-pathfinder').goals;
+// Assurez-vous que le chemin vers settings.json est correct
+const config = require('./settings.json'); 
 
-const config = require('./settings.json');
-const express = require('express');
+let bot = null; // Variable pour stocker l'instance actuelle du bot
 
-const app = express();
-
-app.get('/', (req, res) => {
-  res.send('Bot has arrived');
-});
-
-app.listen(8000, () => {
-  console.log('Server started');
-});
-
-function createBot() {
-   const bot = mineflayer.createBot({
-      username: config['bot-account']['username'],
-      password: config['bot-account']['password'],
-      auth: config['bot-account']['type'],
-      host: config.server.ip,
-      port: config.server.port,
-      version: config.server.version,
-   });
-
-   bot.loadPlugin(pathfinder);
-   const mcData = require('minecraft-data')(bot.version);
-   const defaultMove = new Movements(bot, mcData);
-   bot.settings.colorsEnabled = false;
-
-   let pendingPromise = Promise.resolve();
-
-   function sendRegister(password) {
-      return new Promise((resolve, reject) => {
-         bot.chat(`/register ${password} ${password}`);
-         console.log(`[Auth] Sent /register command.`);
-
-         bot.once('chat', (username, message) => {
-            console.log(`[ChatLog] <${username}> ${message}`); // Log all chat messages
-
-            // Check for various possible responses
-            if (message.includes('successfully registered')) {
-               console.log('[INFO] Registration confirmed.');
-               resolve();
-            } else if (message.includes('already registered')) {
-               console.log('[INFO] Bot was already registered.');
-               resolve(); // Resolve if already registered
-            } else if (message.includes('Invalid command')) {
-               reject(`Registration failed: Invalid command. Message: "${message}"`);
-            } else {
-               reject(`Registration failed: unexpected message "${message}".`);
-            }
-         });
-      });
-   }
-
-   function sendLogin(password) {
-      return new Promise((resolve, reject) => {
-         bot.chat(`/login ${password}`);
-         console.log(`[Auth] Sent /login command.`);
-
-         bot.once('chat', (username, message) => {
-            console.log(`[ChatLog] <${username}> ${message}`); // Log all chat messages
-
-            if (message.includes('successfully logged in')) {
-               console.log('[INFO] Login successful.');
-               resolve();
-            } else if (message.includes('Invalid password')) {
-               reject(`Login failed: Invalid password. Message: "${message}"`);
-            } else if (message.includes('not registered')) {
-               reject(`Login failed: Not registered. Message: "${message}"`);
-            } else {
-               reject(`Login failed: unexpected message "${message}".`);
-            }
-         });
-      });
-   }
-
-   bot.once('spawn', () => {
-      console.log('\x1b[33m[AfkBot] Bot joined the server', '\x1b[0m');
-
-      if (config.utils['auto-auth'].enabled) {
-         console.log('[INFO] Started auto-auth module');
-
-         const password = config.utils['auto-auth'].password;
-
-         pendingPromise = pendingPromise
-            .then(() => sendRegister(password))
-            .then(() => sendLogin(password))
-            .catch(error => console.error('[ERROR]', error));
-      }
-
-      if (config.utils['chat-messages'].enabled) {
-         console.log('[INFO] Started chat-messages module');
-         const messages = config.utils['chat-messages']['messages'];
-
-         if (config.utils['chat-messages'].repeat) {
-            const delay = config.utils['chat-messages']['repeat-delay'];
-            let i = 0;
-
-            let msg_timer = setInterval(() => {
-               bot.chat(`${messages[i]}`);
-
-               if (i + 1 === messages.length) {
-                  i = 0;
-               } else {
-                  i++;
-               }
-            }, delay * 1000);
-         } else {
-            messages.forEach((msg) => {
-               bot.chat(msg);
-            });
-         }
-      }
-
-      const pos = config.position;
-
-      if (config.position.enabled) {
-         console.log(
-            `\x1b[32m[Afk Bot] Starting to move to target location (${pos.x}, ${pos.y}, ${pos.z})\x1b[0m`
-         );
-         bot.pathfinder.setMovements(defaultMove);
-         bot.pathfinder.setGoal(new GoalBlock(pos.x, pos.y, pos.z));
-      }
-
-      if (config.utils['anti-afk'].enabled) {
-         bot.setControlState('jump', true);
-         if (config.utils['anti-afk'].sneak) {
-            bot.setControlState('sneak', true);
-         }
-      }
-   });
-
-   bot.on('goal_reached', () => {
-      console.log(
-         `\x1b[32m[AfkBot] Bot arrived at the target location. ${bot.entity.position}\x1b[0m`
-      );
-   });
-
-   bot.on('death', () => {
-      console.log(
-         `\x1b[33m[AfkBot] Bot has died and was respawned at ${bot.entity.position}`,
-         '\x1b[0m'
-      );
-   });
-
-   if (config.utils['auto-reconnect']) {
-      bot.on('end', () => {
-         setTimeout(() => {
-            createBot();
-         }, config.utils['auto-recconect-delay']);
-      });
-   }
-
-   bot.on('kicked', (reason) =>
-      console.log(
-         '\x1b[33m',
-         `[AfkBot] Bot was kicked from the server. Reason: \n${reason}`,
-         '\x1b[0m'
-      )
-   );
-
-   bot.on('error', (err) =>
-      console.log(`\x1b[31m[ERROR] ${err.message}`, '\x1b[0m')
-   );
+// --- 1. GENERATEUR DE NOM D'UTILISATEUR ALEATOIRE ---
+function generateRandomUsername() {
+    // Caractères possibles pour le suffixe
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = 'AFK_';
+    
+    // Génère un suffixe aléatoire de 6 caractères
+    for (let i = 0; i < 6; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    // Exemple: AFK_hY7tP9
+    return result; 
 }
 
-createBot();
+// --- 2. FONCTION DE CREATION ET CONNEXION DU BOT ---
+function createBot(username) {
+    console.log(`[CYCLE] Tentative de connexion avec le nouveau nom: ${username}`);
+
+    const botOptions = {
+        host: config.host,
+        port: config.port,
+        username: username, // Utilisation du nom aléatoire généré
+        version: config.version,
+        auth: config.auth, 
+        // Ajoutez ici toutes les autres options de connexion de votre bot (ex: hideErrors, clientToken, etc.)
+    };
+    
+    const newBot = mineflayer.createBot(botOptions);
+
+    // --- DEPLACEZ TOUTE LA LOGIQUE EXISTANTE DU BOT ICI ---
+    // (Exemples d'événements à transférer)
+
+    newBot.on('error', (err) => {
+        console.error(`[ERREUR] Une erreur s'est produite: ${err.message}`);
+    });
+
+    newBot.on('kicked', (reason) => {
+        console.log(`[DECONNEXION] Le bot a été kické: ${reason}`);
+        // Laissez le planificateur (scheduler) gérer le prochain redémarrage
+    });
+
+    newBot.on('spawn', () => {
+        console.log(`[CONNEXION] Bot connecté avec succès! Nom: ${newBot.username}`);
+        // Mettez ici votre logique d'AFK et de mouvement (ex: bot.setControlState, bot.afk)
+    });
+    
+    // --------------------------------------------------------
+
+    return newBot;
+}
+
+// --- 3. FONCTION DE REDEMARRAGE ET CHANGEMENT DE NOM ---
+function cycleBot() {
+    // Déconnecter le bot actuel si une instance existe
+    if (bot) {
+        console.log('[CYCLE] Déconnexion de l\'instance actuelle pour changement de nom...');
+        // bot.end() déconnecte le bot et nettoie ses ressources
+        bot.end();
+        bot = null; // Supprime la référence
+    }
+
+    // Générer un nouveau nom d'utilisateur
+    const newUsername = generateRandomUsername();
+
+    // Créer et démarrer une nouvelle instance du bot
+    bot = createBot(newUsername);
+}
+
+// --- 4. PLANIFICATEUR (SCHEDULER) ---
+
+// 3 heures en millisecondes: 3 * 60 minutes * 60 secondes * 1000 ms
+const intervalTime = 3 * 60 * 60 * 1000; 
+// Si vous voulez tester avec 5 minutes (300000 ms), changez la valeur
+
+console.log(`[SCHEDULER] Le bot changera de nom et redémarrera automatiquement toutes les ${intervalTime / (60 * 60 * 1000)} heures.`);
+
+// Démarre le cycle initial immédiatement
+cycleBot();
+
+// Configure le redémarrage périodique
+setInterval(cycleBot, intervalTime);
