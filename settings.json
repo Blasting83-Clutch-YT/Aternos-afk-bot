@@ -1,27 +1,27 @@
 {
   "bot-account": {
-    "username": "AFKBot", 
+    "username": "AFKBotttt", 
     "password": "",
     "type": "mojang"
   },
 
   "server": {
-    "ip": "Zynexx.aternos.me", 
+    "ip": "waguriismp.aternos.me", 
     "port": 58031,   
     "version": "1.12.1"   
   },
   
   "position": {
-    "enabled": false,
+    "enabled": enable,
     "x": 0,
-    "y": 0,
+    "y": 100,
     "z": 0
   },
 
   "utils": {
     "auto-auth": {
-      "enabled": false,
-      "password": ""
+      "enabled": true,
+      "password": "chalol78"
     },
 
     "anti-afk": {
